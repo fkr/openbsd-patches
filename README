@@ -1,0 +1,4 @@
+Various openbsd patches
+-----------------------
+
+sys/dev/isa/wbsio.diff   - adds watchdog support for Winbond W83627THF, 83697HF
