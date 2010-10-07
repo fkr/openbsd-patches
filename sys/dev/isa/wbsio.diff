@@ -1,0 +1,225 @@
+Index: sys/dev/isa/wbsio.c
+===================================================================
+RCS file: /cvs//src/sys/dev/isa/wbsio.c,v
+retrieving revision 1.5
+diff -u -r1.5 wbsio.c
+--- sys/dev/isa/wbsio.c	29 Mar 2009 21:53:52 -0000	1.5
++++ sys/dev/isa/wbsio.c	30 Jun 2010 14:09:38 -0000
+@@ -52,8 +52,23 @@
+ #define WBSIO_ID_W83697HF	0x60
+ 
+ /* Logical Device Number (LDN) Assignments */
++#define WBSIO_LDN_WDOG		0x08
+ #define WBSIO_LDN_HM		0x0b
+ 
++/* Watchdog / GPIO2 Control Registers (LDN 8) */
++#define WBSIO_WDOG		0x30
++#define WBSIO_WDOG_83627_PLED	0xf5
++#define WBSIO_WDOG_83697_PLED	0xf3
++#define WBSIO_WDOG_83627_TIMER	0xf6
++#define WBSIO_WDOG_83697_TIMER	0xf4
++#define WBSIO_WDOG_83627_CTRL	0xf7
++#define WBSIO_WDOG_83697_CTRL	0xf5
++
++/* CR 0x30 values for logical device 8 */
++#define WBSIO_WDOG_ACTIVE	0x01
++
++#define WBSIO_WDOG_IRQ_SMI	0x02
++
+ /* Hardware Monitor Control Registers (LDN B) */
+ #define WBSIO_HM_ADDR_MSB	0x60	/* Address [15:8] */
+ #define WBSIO_HM_ADDR_LSB	0x61	/* Address [7:0] */
+@@ -69,11 +84,16 @@
+ 
+ 	bus_space_tag_t		sc_iot;
+ 	bus_space_handle_t	sc_ioh;
++
++	u_int8_t		sc_type;
+ };
+ 
+ int	wbsio_probe(struct device *, void *, void *);
+ void	wbsio_attach(struct device *, struct device *, void *);
+ int	wbsio_print(void *, const char *);
++void	wbsio_wdog_83627_init(struct wbsio_softc *);
++void	wbsio_wdog_83697_init(struct wbsio_softc *);
++int	wbsio_wdog_set_timeout(void *, int);
+ 
+ struct cfattach wbsio_ca = {
+ 	sizeof(struct wbsio_softc),
+@@ -156,6 +176,7 @@
+ 	struct isa_attach_args nia;
+ 	u_int8_t reg, reg0, reg1;
+ 	u_int16_t iobase;
++	int wdog_present = 0;
+ 
+ 	/* Map ISA I/O space */
+ 	sc->sc_iot = ia->ia_iot;
+@@ -173,9 +194,11 @@
+ 	switch (reg) {
+ 	case WBSIO_ID_W83627HF:
+ 		printf(": W83627HF");
++		wdog_present = 1;
+ 		break;
+ 	case WBSIO_ID_W83627THF:
+ 		printf(": W83627THF");
++		wdog_present = 1;
+ 		break;
+ 	case WBSIO_ID_W83627EHF:
+ 		printf(": W83627EHF");
+@@ -188,9 +211,12 @@
+ 		break;
+ 	case WBSIO_ID_W83697HF:
+ 		printf(": W83697HF");
++		wdog_present = 1;
+ 		break;
+ 	}
+ 
++	sc->sc_type = reg;
++
+ 	/* Read device revision */
+ 	reg = wbsio_conf_read(sc->sc_iot, sc->sc_ioh, WBSIO_REV);
+ 	printf(" rev 0x%02x", reg);
+@@ -209,7 +235,15 @@
+ 	iobase = (reg1 << 8) | (reg0 & ~0x7);
+ 
+ 	printf("\n");
+-
++	
++	if (wdog_present == 1) {
++		if ((sc->sc_type == WBSIO_ID_W83627HF) || 
++		    (sc->sc_type == WBSIO_ID_W83627THF))
++			wbsio_wdog_83627_init(sc);
++		if (sc->sc_type == WBSIO_ID_W83697HF)
++			wbsio_wdog_83697_init(sc);
++	}	
++	
+ 	/* Escape from configuration mode */
+ 	wbsio_conf_disable(sc->sc_iot, sc->sc_ioh);
+ 
+@@ -219,6 +253,10 @@
+ 	nia = *ia;
+ 	nia.ia_iobase = iobase;
+ 	config_found(self, &nia, wbsio_print);
++
++	if (wdog_present == 1)
++		/* register with kernel watchdog */
++		wdog_register(sc, wbsio_wdog_set_timeout);
+ }
+ 
+ int
+@@ -233,4 +271,73 @@
+ 	if (ia->ia_iosize > 1)
+ 		printf("/%d", ia->ia_iosize);
+ 	return (UNCONF);
++}
++
++void
++wbsio_wdog_83627_init(struct wbsio_softc *self)
++{
++	struct wbsio_softc *sc = (void *)self;
++	u_int8_t reg;
++
++	/* Select logical device 8 */
++	wbsio_conf_write(sc->sc_iot, sc->sc_ioh, WBSIO_LDN, WBSIO_LDN_WDOG);
++
++	/* Enable gpio2 */
++	wbsio_conf_write(sc->sc_iot, sc->sc_ioh, WBSIO_WDOG, WBSIO_WDOG_ACTIVE);
++
++	/* Set initial timeout in CRF6 to 0 (disarmed) */
++	wbsio_conf_write(sc->sc_iot, sc->sc_ioh, WBSIO_WDOG_83627_TIMER, 0);
++
++	/* Set CRF5 it to clean state - some boards have weird values */
++	reg = wbsio_conf_read(sc->sc_iot, sc->sc_ioh, WBSIO_WDOG_83627_PLED);
++	reg &=~ 0x0C;
++	wbsio_conf_write(sc->sc_iot, sc->sc_ioh, WBSIO_WDOG_83627_PLED, reg);
++
++	/* Set IRQ resource of watchdog to SMI */
++	wbsio_conf_write(sc->sc_iot, sc->sc_ioh, WBSIO_WDOG_83627_CTRL, 
++	    WBSIO_WDOG_IRQ_SMI);
++}
++
++void
++wbsio_wdog_83697_init(struct wbsio_softc *self)
++{
++	struct wbsio_softc *sc = (void *)self;
++
++	/* Select logical device 8 */
++	wbsio_conf_write(sc->sc_iot, sc->sc_ioh, WBSIO_LDN, WBSIO_LDN_WDOG);
++
++	/* Enable gpio2 */
++	wbsio_conf_write(sc->sc_iot, sc->sc_ioh, WBSIO_WDOG, WBSIO_WDOG_ACTIVE);
++
++	/* Set initial timeout in CRF6 to 0 (disarmed) */
++	wbsio_conf_write(sc->sc_iot, sc->sc_ioh, WBSIO_WDOG_83697_TIMER, 0);
++}
++
++int
++wbsio_wdog_set_timeout(void *self, int seconds)
++{
++	struct wbsio_softc *sc = (struct wbsio_softc *)self;
++	u_int8_t timer_reg;
++	int s;
++
++	DPRINTF(("wbsio_set_timeout: %d\n", seconds));
++
++	if ((sc->sc_type == WBSIO_ID_W83627HF) || 
++	    (sc->sc_type == WBSIO_ID_W83627THF))
++		timer_reg = WBSIO_WDOG_83627_TIMER;
++	if (sc->sc_type == WBSIO_ID_W83697HF)
++		timer_reg = WBSIO_WDOG_83697_TIMER;
++
++	s = splclock();
++
++	wbsio_conf_enable(sc->sc_iot, sc->sc_ioh);
++
++	if (seconds)
++		wbsio_conf_write(sc->sc_iot, sc->sc_ioh, timer_reg, seconds);
++	else
++		wbsio_conf_write(sc->sc_iot, sc->sc_ioh, timer_reg, 0);
++
++	wbsio_conf_disable(sc->sc_iot, sc->sc_ioh);
++	splx(s);
++	return(seconds);
+ }
+Index: share/man/man4/wbsio.4
+===================================================================
+RCS file: /cvs//src/share/man/man4/wbsio.4,v
+retrieving revision 1.2
+diff -u -r1.2 wbsio.4
+--- share/man/man4/wbsio.4	17 Feb 2008 16:48:47 -0000	1.2
++++ share/man/man4/wbsio.4	30 Jun 2010 14:09:38 -0000
+@@ -27,22 +27,31 @@
+ The
+ .Nm
+ driver provides support for the Winbond LPC Super I/O ICs.
+-Only the hardware monitoring function is currently supported.
++Only the hardware monitoring and watchdog functions are currently supported.
+ .Pp
+ Support for the hardware monitor function is provided through the
+ .Xr lm 4
+ driver.
++.Pp
++The watchdog timer may be configured via
++.Xr sysctl 8 .
+ .Sh SEE ALSO
+ .Xr intro 4 ,
+ .Xr isa 4 ,
+-.Xr lm 4
++.Xr lm 4 ,
++.Xr watchdog 4 ,
++.Xr sysctl 8 
+ .Sh HISTORY
+ The
+ .Nm
+ driver first appeared in
+ .Ox 4.3 .
++Support for the watchdog was added in
++.Ox 4.8 .
+ .Sh AUTHORS
+ The
+ .Nm
+ driver was written by
+ .An Mark Kettenis Aq kettenis@openbsd.org .
++Support for the watchdog timer was written by
++.An Felix Kronlage Aq fkr@openbsd.org .
+
